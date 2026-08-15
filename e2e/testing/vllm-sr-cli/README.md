@@ -34,6 +34,9 @@ These tests start real containers and verify with `docker inspect`:
 | Test | What it verifies |
 |------|------------------|
 | `test_running_container_contracts` | canonical config → serve → router container running → health |
+| `test_overlapping_v1_base_url_is_rewritten_once` | immutable original path overrides ext_proc/current path state for chat and Responses API requests to a `/v1/proxy` provider |
+| `test_provider_chat_path_remains_authoritative` | selected-route metadata preserves a custom provider chat path and Azure API version without reading current `:path` |
+| `test_overlapping_v1_legacy_endpoint_is_rewritten_once` | immutable original path overrides a forged header and applies a legacy `/v1/proxy` endpoint once |
 | `test_fleet_sim_sidecar_contracts` | `vllm-sr serve` starts the simulator sidecar and exposes `/healthz` |
 | `test_env_var_passed_to_container` | HF_TOKEN inside container |
 | `test_volume_mounting` | config.yaml + models/ mounted |

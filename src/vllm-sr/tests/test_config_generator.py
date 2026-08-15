@@ -101,12 +101,218 @@ def _model_route(rendered_config, model_name):
     raise AssertionError(f"route for model {model_name!r} not found")
 
 
+def _path_rewrite_lua(rendered_config):
+    listener = rendered_config["static_resources"]["listeners"][0]
+    hcm = listener["filter_chains"][0]["filters"][0]["typed_config"]
+    for http_filter in hcm["http_filters"]:
+        typed_config = http_filter.get("typed_config", {})
+        inline_code = typed_config.get("inline_code", "")
+        if "SELECTED_ROUTE_BY_MODEL" in inline_code:
+            return http_filter, inline_code
+    raise AssertionError("path rewrite Lua filter not found")
+
+
+def _lua_route_spec(lua_code, model_name):
+    marker = f'["{model_name}"] = {{'
+    start = lua_code.index(marker)
+    end = lua_code.index("},", start) + 2
+    return lua_code[start:end]
+
+
+def _original_path_header_mutation(rendered_config):
+    listener = rendered_config["static_resources"]["listeners"][0]
+    hcm = listener["filter_chains"][0]["filters"][0]["typed_config"]
+    for http_filter in hcm["http_filters"]:
+        if http_filter["name"] == "envoy.filters.http.header_mutation":
+            return http_filter
+    raise AssertionError("original-path header mutation filter not found")
+
+
+def _default_route(rendered_config):
+    listener = rendered_config["static_resources"]["listeners"][0]
+    hcm = listener["filter_chains"][0]["filters"][0]["typed_config"]
+    return hcm["route_config"]["virtual_hosts"][0]["routes"][-1]
+
+
+def _assert_original_path_pipeline(rendered_config, lua_filter):
+    listener = rendered_config["static_resources"]["listeners"][0]
+    hcm = listener["filter_chains"][0]["filters"][0]["typed_config"]
+    http_filters = hcm["http_filters"]
+    header_mutation = _original_path_header_mutation(rendered_config)
+    request_mutation = header_mutation["typed_config"]["mutations"][
+        "request_mutations"
+    ][0]["append"]
+    assert request_mutation["header"] == {
+        "key": "x-vsr-original-path",
+        "value": "%REQ(:PATH)%",
+    }
+    assert request_mutation["append_action"] == "OVERWRITE_IF_EXISTS_OR_ADD"
+
+    header_mutation_index = http_filters.index(header_mutation)
+    extproc_index = next(
+        index
+        for index, item in enumerate(http_filters)
+        if item["name"] == "envoy.filters.http.ext_proc"
+    )
+    extproc_config = http_filters[extproc_index]["typed_config"]
+    assert extproc_config["mutation_rules"] == {
+        "disallow_expression": {
+            "regex": "^x-vsr-original-path$",
+        },
+        "disallow_is_error": True,
+    }
+    lua_index = http_filters.index(lua_filter)
+    router_index = next(
+        index
+        for index, item in enumerate(http_filters)
+        if item["name"] == "envoy.filters.http.router"
+    )
+    assert header_mutation_index < extproc_index < lua_index < router_index
+
+
+def test_path_rewrite_lua_runs_after_model_selection(tmp_path, monkeypatch):
+    rendered = _render_envoy_config(
+        tmp_path,
+        monkeypatch,
+        """
+version: v0.3
+listeners:
+  - name: "http-8899"
+    address: "0.0.0.0"
+    port: 8899
+providers:
+  defaults:
+    default_model: "gemini-model"
+  models:
+    - name: "gemini-model"
+      provider_model_id: "gemini-model"
+      backend_refs:
+        - name: "gemini"
+          base_url: "https://generativelanguage.googleapis.com/v1beta/openai"
+          provider: "openai"
+          weight: 100
+    - name: "v1-proxy-model"
+      provider_model_id: "v1-proxy-model"
+      backend_refs:
+        - name: "proxy"
+          base_url: "https://api.example.com/v1/proxy"
+          provider: "openai"
+          weight: 100
+routing:
+  modelCards:
+    - name: "gemini-model"
+    - name: "v1-proxy-model"
+  decisions:
+    - name: "default-route"
+      description: "default route"
+      priority: 100
+      rules:
+        operator: "AND"
+        conditions: []
+      modelRefs:
+        - model: "gemini-model"
+          use_reasoning: false
+""",
+        extproc_host="localhost",
+        router_api_host="localhost",
+    )
+
+    for route in (
+        _model_route(rendered, "gemini-model"),
+        _model_route(rendered, "v1-proxy-model"),
+        _default_route(rendered),
+    ):
+        assert "regex_rewrite" not in route["route"]
+
+    lua_filter, lua_code = _path_rewrite_lua(rendered)
+    gemini_route = _lua_route_spec(lua_code, "gemini-model")
+    assert 'path_prefix = "/v1beta/openai"' in gemini_route
+    assert 'chat_path = "/v1beta/openai/chat/completions"' in gemini_route
+    proxy_route = _lua_route_spec(lua_code, "v1-proxy-model")
+    assert 'path_prefix = "/v1/proxy"' in proxy_route
+    assert 'chat_path = "/v1/proxy/chat/completions"' in proxy_route
+    assert 'local DEFAULT_MODEL = "gemini-model"' in lua_code
+    assert "request_handle:body()" in lua_code
+    assert 'headers:get("x-vsr-original-path")' in lua_code
+    assert 'headers:get(":path")' not in lua_code
+    assert "rewrite_path(original_path, selected_route)" in lua_code
+    assert 'if path == "/v1/responses" then' in lua_code
+    assert "missing immutable x-vsr-original-path header" in lua_code
+    assert '[":status"] = "500"' in lua_code
+    assert "x-envoy-original-path" not in lua_code
+    _assert_original_path_pipeline(rendered, lua_filter)
+
+
+def test_path_rewrite_route_carries_provider_chat_path(tmp_path, monkeypatch):
+    rendered = _render_envoy_config(
+        tmp_path,
+        monkeypatch,
+        """
+version: v0.3
+listeners:
+  - name: http-8899
+    address: 0.0.0.0
+    port: 8899
+providers:
+  defaults:
+    default_model: custom-model
+  models:
+    - name: custom-model
+      backend_refs:
+        - name: custom
+          base_url: https://api.example.com/v1
+          provider: openai
+          chat_path: /custom/chat
+    - name: azure-model
+      backend_refs:
+        - name: azure
+          base_url: https://example.openai.azure.com/openai/deployments/gpt-4o
+          provider: azure-openai
+          api_version: "2024-10-21"
+routing:
+  modelCards:
+    - name: custom-model
+    - name: azure-model
+  decisions:
+    - name: default-route
+      description: default route
+      priority: 100
+      rules:
+        operator: AND
+        conditions: []
+      modelRefs:
+        - model: custom-model
+""",
+        extproc_host="localhost",
+        router_api_host="localhost",
+    )
+
+    _, lua_code = _path_rewrite_lua(rendered)
+    custom_route = _lua_route_spec(lua_code, "custom-model")
+    assert 'path_prefix = "/v1"' in custom_route
+    assert 'chat_path = "/custom/chat"' in custom_route
+
+    azure_route = _lua_route_spec(lua_code, "azure-model")
+    assert 'path_prefix = "/openai/deployments/gpt-4o"' in azure_route
+    assert (
+        'chat_path = "/openai/deployments/gpt-4o/chat/completions'
+        '?api-version=2024-10-21"'
+    ) in azure_route
+
+    responses_branch = lua_code.index('if path == "/v1/responses" then')
+    selected_prefix_branch = lua_code.index(
+        "if path_has_prefix(path, selected_route.path_prefix) then"
+    )
+    assert responses_branch < selected_prefix_branch
+    assert 'if route_query ~= "" then' in lua_code
+
+
 def test_backend_ref_ip_port_path_produces_correct_envoy_cluster_and_route(
     tmp_path, monkeypatch
 ):
     """Backend ref http://10.0.0.1:8000/v1 should split into address=10.0.0.1,
     port=8000, host_authority=10.0.0.1:8000, path_prefix=/v1, and the route
-    should use regex ^/v1(.*)$ to avoid duplicating /v1."""
+    should leave path rewriting to the post-ext_proc Lua filter."""
     rendered = _render_envoy_config(
         tmp_path,
         monkeypatch,
@@ -155,8 +361,11 @@ routing:
     route = _model_route(rendered, "test-model")
     route_action = route["route"]
     assert route_action["host_rewrite_literal"] == "10.0.0.1:8000"
-    assert route_action["regex_rewrite"]["pattern"]["regex"] == "^/v1(.*)$"
-    assert route_action["regex_rewrite"]["substitution"] == "/v1\\1"
+    assert "regex_rewrite" not in route_action
+    _, lua_code = _path_rewrite_lua(rendered)
+    route_spec = _lua_route_spec(lua_code, "test-model")
+    assert 'path_prefix = "/v1"' in route_spec
+    assert "chat_path" not in route_spec
 
 
 def test_provider_reliability_renders_retry_outlier_and_least_request(
@@ -228,7 +437,7 @@ def test_backend_ref_domain_with_path_produces_correct_envoy_cluster_and_route(
 ):
     """Backend ref https://api.example.com/compatible-mode/v1 should produce
     address=api.example.com, port=443, host_authority=api.example.com (standard
-    port omitted), LOGICAL_DNS cluster, and regex_rewrite for path prefix."""
+    port omitted), LOGICAL_DNS cluster, and Lua path-prefix rewriting."""
     rendered = _render_envoy_config(
         tmp_path,
         monkeypatch,
@@ -279,8 +488,11 @@ routing:
     route_action = route["route"]
     # standard port 443 → host_authority should omit port
     assert route_action["host_rewrite_literal"] == "api.example.com"
-    assert route_action["regex_rewrite"]["pattern"]["regex"] == "^/v1(.*)$"
-    assert route_action["regex_rewrite"]["substitution"] == "/compatible-mode/v1\\1"
+    assert "regex_rewrite" not in route_action
+    _, lua_code = _path_rewrite_lua(rendered)
+    route_spec = _lua_route_spec(lua_code, "test-model")
+    assert 'path_prefix = "/compatible-mode/v1"' in route_spec
+    assert "chat_path" not in route_spec
 
 
 def test_backend_ref_https_base_url_uses_tls_and_explicit_extra_headers(
@@ -338,7 +550,11 @@ routing:
     route = _model_route(rendered, "test-model")
     route_action = route["route"]
     assert route_action["host_rewrite_literal"] == "openrouter.ai"
-    assert route_action["regex_rewrite"]["substitution"] == "/api/v1\\1"
+    assert "regex_rewrite" not in route_action
+    _, lua_code = _path_rewrite_lua(rendered)
+    route_spec = _lua_route_spec(lua_code, "test-model")
+    assert 'path_prefix = "/api/v1"' in route_spec
+    assert 'chat_path = "/api/v1/chat/completions"' in route_spec
 
     headers = {
         item["header"]["key"]: item["header"]["value"]

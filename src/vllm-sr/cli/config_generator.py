@@ -13,6 +13,42 @@ from cli.utils import get_logger
 
 log = get_logger(__name__)
 
+_PROVIDER_CHAT_PATHS = {
+    "openai": "/chat/completions",
+    "anthropic": "/v1/messages",
+    "azure-openai": "/chat/completions",
+    "bedrock": "/chat/completions",
+    "gemini": "/chat/completions",
+    "vertex-ai": "/chat/completions",
+    "minimax": "/v1/chat/completions",
+}
+
+
+def _join_paths(prefix: str, suffix: str) -> str:
+    """Join an upstream base path and provider endpoint path."""
+    if not prefix:
+        return suffix
+    return f"{prefix.rstrip('/')}/{suffix.lstrip('/')}"
+
+
+def _resolve_backend_chat_path(
+    *,
+    provider: str,
+    chat_path: str,
+    api_version: str,
+    base_path: str,
+) -> str:
+    """Mirror the provider chat-path contract for Envoy's selected route."""
+    if not chat_path:
+        suffix = _PROVIDER_CHAT_PATHS.get(provider)
+        if suffix is None:
+            return ""
+        chat_path = _join_paths(base_path, suffix)
+
+    if provider == "azure-openai" and api_version:
+        chat_path += f"?api-version={api_version}"
+    return chat_path
+
 
 def _uses_shared_anthropic_cluster(model) -> bool:
     """Use api.anthropic.com only when no custom upstream host is configured."""
@@ -169,6 +205,12 @@ def generate_envoy_config_from_user_config(
                     # Default port based on protocol
                     port = 443 if protocol == "https" else 80
 
+            provider_base_path = path
+            if backend.base_url:
+                provider_url = urlparse(backend.base_url)
+                if provider_url.scheme and provider_url.netloc:
+                    provider_base_path = provider_url.path.rstrip("/")
+
             # Check if this is HTTPS (for transport_socket)
             is_https = protocol == "https"
             if is_https:
@@ -197,11 +239,15 @@ def generate_envoy_config_from_user_config(
                         f"{host}:{port}" if int(port) not in (80, 443) else host
                     ),
                     "path": path,
+                    "provider_base_path": provider_base_path,
                     "weight": backend.weight,
                     "protocol": protocol,
                     "is_https": is_https,
                     "is_domain": is_domain,
                     "extra_headers": extra_headers,
+                    "provider": backend.provider or "",
+                    "api_version": backend.api_version or "",
+                    "chat_path": backend.chat_path or "",
                 }
             )
 
@@ -217,12 +263,23 @@ def generate_envoy_config_from_user_config(
 
         # Determine path prefix - use the first endpoint's path if all endpoints have the same path
         path_prefix = ""
+        chat_path = ""
         route_request_headers = []
         if endpoints:
             first_path = endpoints[0].get("path", "")
             if first_path and all(ep.get("path", "") == first_path for ep in endpoints):
                 path_prefix = first_path
             route_request_headers = _route_request_headers(endpoints[0])
+            primary_backend_index = max(
+                range(len(endpoints)),
+                key=lambda index: endpoints[index]["weight"],
+            )
+            chat_path = _resolve_backend_chat_path(
+                provider=endpoints[primary_backend_index]["provider"],
+                chat_path=endpoints[primary_backend_index]["chat_path"],
+                api_version=endpoints[primary_backend_index]["api_version"],
+                base_path=endpoints[primary_backend_index]["provider_base_path"],
+            )
 
         models.append(
             {
@@ -232,6 +289,7 @@ def generate_envoy_config_from_user_config(
                 "cluster_type": cluster_type,
                 "has_https": has_https,
                 "path_prefix": path_prefix,
+                "chat_path": chat_path,
                 "route_request_headers": route_request_headers,
                 "reliability": (
                     model.reliability.model_dump()

@@ -4,6 +4,7 @@ admin:
       address: 0.0.0.0
       port_value: 9901
 
+{% set path_rewrite_models = models | selectattr("path_prefix") | list %}
 static_resources:
   listeners:
   {% for listener in listeners %}
@@ -64,14 +65,6 @@ static_resources:
                   {% endif %}
                   # Rewrite Host header to match upstream server
                   host_rewrite_literal: "{{ model.endpoints[0].host_authority }}"
-                  {% if model.path_prefix %}
-                  # Prepend path prefix to all requests (e.g., /compatible-mode + /v1/chat/completions = /compatible-mode/v1/chat/completions)
-                  regex_rewrite:
-                    pattern:
-                      google_re2: {}
-                      regex: "^/v1(.*)$"
-                    substitution: "{{ model.path_prefix }}\\1"
-                  {% endif %}
               {% endfor %}
               {% for model in anthropic_models %}
               # Route for Anthropic model: {{ model.name }}
@@ -116,14 +109,6 @@ static_resources:
                   # Rewrite Host header to match upstream server
                   host_rewrite_literal: "{{ models[0].endpoints[0].host_authority }}"
                   {% endif %}
-                  {% if models and models[0].path_prefix %}
-                  # Prepend path prefix to all requests (e.g., /compatible-mode + /v1/chat/completions = /compatible-mode/v1/chat/completions)
-                  regex_rewrite:
-                    pattern:
-                      google_re2: {}
-                      regex: "^/v1(.*)$"
-                    substitution: "{{ models[0].path_prefix }}\\1"
-                  {% endif %}
           http_filters:
           {% if listener.api_keys %}
           - name: envoy.filters.http.lua
@@ -153,6 +138,19 @@ static_resources:
                   )
                 end
           {% endif %}
+          {% if path_rewrite_models %}
+          # Capture the downstream path once and replace any client-supplied value.
+          - name: envoy.filters.http.header_mutation
+            typed_config:
+              "@type": type.googleapis.com/envoy.extensions.filters.http.header_mutation.v3.HeaderMutation
+              mutations:
+                request_mutations:
+                - append:
+                    header:
+                      key: x-vsr-original-path
+                      value: "%REQ(:PATH)%"
+                    append_action: OVERWRITE_IF_EXISTS_OR_ADD
+          {% endif %}
           - name: envoy.filters.http.ext_proc
             typed_config:
               "@type": type.googleapis.com/envoy.extensions.filters.http.ext_proc.v3.ExternalProcessor
@@ -167,6 +165,21 @@ static_resources:
                 request_body_mode: "BUFFERED"
                 response_body_mode: "BUFFERED"
               message_timeout: {{ listener.timeout | default('1200s') }}
+              {% if path_rewrite_models %}
+              mutation_rules:
+                disallow_expression:
+                  regex: "^x-vsr-original-path$"
+                disallow_is_error: true
+              {% endif %}
+          {% if path_rewrite_models %}
+          - name: envoy.filters.http.lua
+            typed_config:
+              "@type": type.googleapis.com/envoy.extensions.filters.http.lua.v3.Lua
+              inline_code: |
+{% filter indent(width=16, first=True) -%}
+{% include "path_rewrite.lua" %}
+{% endfilter %}
+          {% endif %}
           - name: envoy.filters.http.router
             typed_config:
               "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
@@ -175,7 +188,7 @@ static_resources:
             typed_config:
               "@type": type.googleapis.com/envoy.extensions.access_loggers.file.v3.FileAccessLog
               path: /var/log/envoy_access.log
-              format: "[%START_TIME%] \"%REQ(:METHOD)% %REQ(X-ENVOY-ORIGINAL-PATH?:PATH)% %PROTOCOL%\" %RESPONSE_CODE% %RESPONSE_FLAGS% %BYTES_RECEIVED% %BYTES_SENT% %DURATION% %RESP(X-ENVOY-UPSTREAM-SERVICE-TIME)% \"%REQ(X-FORWARDED-FOR)%\" \"%REQ(USER-AGENT)%\" \"%REQ(X-REQUEST-ID)%\" \"%REQ(:AUTHORITY)%\" \"%UPSTREAM_HOST%\"\n"
+              format: "[%START_TIME%] \"%REQ(:METHOD)% %REQ(X-VSR-ORIGINAL-PATH?:PATH)% %PROTOCOL%\" %RESPONSE_CODE% %RESPONSE_FLAGS% %BYTES_RECEIVED% %BYTES_SENT% %DURATION% %RESP(X-ENVOY-UPSTREAM-SERVICE-TIME)% \"%REQ(X-FORWARDED-FOR)%\" \"%REQ(USER-AGENT)%\" \"%REQ(X-REQUEST-ID)%\" \"%REQ(:AUTHORITY)%\" \"%UPSTREAM_HOST%\"\n"
   {% endfor %}
 
   clusters:

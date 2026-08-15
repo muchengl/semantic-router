@@ -35,6 +35,56 @@ def _coerce_timeout_stream(value: str | bytes | None) -> str:
     return value
 
 
+def _api_only_global_config() -> dict[str, object]:
+    """Disable optional model-backed services for API-only integration tests."""
+    return {
+        "stores": {
+            "response_cache": {
+                "enabled": False,
+            }
+        },
+        "model_catalog": {
+            "embeddings": {
+                "semantic": {
+                    "mmbert_model_path": "",
+                    "qwen3_model_path": "",
+                    "gemma_model_path": "",
+                    "bert_model_path": "",
+                    "multimodal_model_path": "",
+                }
+            },
+            "modules": {
+                "prompt_guard": {
+                    "enabled": False,
+                    "model_ref": "",
+                    "model_id": "",
+                    "jailbreak_mapping_path": "",
+                },
+                "classifier": {
+                    "domain": {
+                        "model_ref": "",
+                        "model_id": "",
+                        "category_mapping_path": "",
+                        "use_mmbert_32k": False,
+                    },
+                    "pii": {
+                        "model_ref": "",
+                        "model_id": "",
+                        "pii_mapping_path": "",
+                        "use_mmbert_32k": False,
+                    },
+                },
+                "feedback_detector": {
+                    "enabled": False,
+                    "model_ref": "",
+                    "model_id": "",
+                    "use_mmbert_32k": False,
+                },
+            },
+        },
+    }
+
+
 class CLITestBase(unittest.TestCase):
     """Base class for vLLM-SR CLI tests."""
 
@@ -298,9 +348,30 @@ class CLITestBase(unittest.TestCase):
         port: int = 8888,
         model_name: str = "test-model",
         endpoint: str = "host.docker.internal:8000",
+        base_url: str | None = None,
+        provider: str | None = None,
+        api_version: str | None = None,
+        chat_path: str | None = None,
+        api_only: bool = False,
     ) -> str:
         """Write a minimal runnable canonical v0.3 config into the temp workspace."""
         config_path = Path(self.test_dir) / "config.yaml"
+        backend_ref: dict[str, object] = {
+            "name": "primary",
+            "weight": 100,
+        }
+        if base_url is not None:
+            backend_ref["base_url"] = base_url
+        else:
+            backend_ref["endpoint"] = endpoint
+            backend_ref["protocol"] = "http"
+        if provider is not None:
+            backend_ref["provider"] = provider
+        if api_version is not None:
+            backend_ref["api_version"] = api_version
+        if chat_path is not None:
+            backend_ref["chat_path"] = chat_path
+
         config = {
             "version": "v0.3",
             "listeners": [
@@ -320,14 +391,7 @@ class CLITestBase(unittest.TestCase):
                     {
                         "name": model_name,
                         "provider_model_id": model_name,
-                        "backend_refs": [
-                            {
-                                "name": "primary",
-                                "weight": 100,
-                                "endpoint": endpoint,
-                                "protocol": "http",
-                            }
-                        ],
+                        "backend_refs": [backend_ref],
                     }
                 ],
             },
@@ -344,6 +408,8 @@ class CLITestBase(unittest.TestCase):
                 ],
             },
         }
+        if api_only:
+            config["global"] = _api_only_global_config()
         config_path.write_text(
             yaml.safe_dump(config, sort_keys=False),
             encoding="utf-8",
